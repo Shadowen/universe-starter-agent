@@ -1,4 +1,3 @@
-from __future__ import print_function
 from collections import namedtuple
 import numpy as np
 import tensorflow as tf
@@ -6,16 +5,17 @@ from model import LSTMPolicy
 import six.moves.queue as queue
 import scipy.signal
 import threading
-import distutils.version
-use_tf12_api = distutils.version.LooseVersion(tf.VERSION) >= distutils.version.LooseVersion('0.12.0')
+from typing import Iterator
+
 
 def discount(x, gamma):
     return scipy.signal.lfilter([1], [1, -gamma], x[::-1], axis=0)[::-1]
 
+
 def process_rollout(rollout, gamma, lambda_=1.0):
     """
-given a rollout, compute its returns and the advantage
-"""
+    Given a rollout, compute its returns and the advantage
+    """
     batch_si = np.asarray(rollout.states)
     batch_a = np.asarray(rollout.actions)
     rewards = np.asarray(rollout.rewards)
@@ -31,13 +31,16 @@ given a rollout, compute its returns and the advantage
     features = rollout.features[0]
     return Batch(batch_si, batch_a, batch_adv, batch_r, rollout.terminal, features)
 
+
 Batch = namedtuple("Batch", ["si", "a", "adv", "r", "terminal", "features"])
+
 
 class PartialRollout(object):
     """
-a piece of a complete rollout.  We run our agent, and process its experience
-once it has processed enough steps.
-"""
+    A piece of a complete rollout.  We run our agent, and process its experience
+    once it has processed enough steps.
+    """
+
     def __init__(self):
         self.states = []
         self.actions = []
@@ -65,18 +68,19 @@ once it has processed enough steps.
         self.terminal = other.terminal
         self.features.extend(other.features)
 
+
 class RunnerThread(threading.Thread):
     """
-One of the key distinctions between a normal environment and a universe environment
-is that a universe environment is _real time_.  This means that there should be a thread
-that would constantly interact with the environment and tell it what to do.  This thread is here.
-"""
-    def __init__(self, env, policy, num_local_steps, visualise):
+    One of the key distinctions between a normal environment and a universe environment
+    is that a universe environment is _real time_.  This means that there should be a thread
+    that would constantly interact with the environment and tell it what to do.  This thread is here.
+    """
+
+    def __init__(self, env, policy: LSTMPolicy, num_local_steps: int, visualise: bool):
         threading.Thread.__init__(self)
         self.queue = queue.Queue(5)
         self.num_local_steps = num_local_steps
         self.env = env
-        self.last_features = None
         self.policy = policy
         self.daemon = True
         self.sess = None
@@ -90,25 +94,22 @@ that would constantly interact with the environment and tell it what to do.  Thi
 
     def run(self):
         with self.sess.as_default():
-            self._run()
+            rollout_provider = env_runner(self.env, self.policy, self.num_local_steps, self.summary_writer,
+                self.visualise)
+            while True:
+                # the timeout variable exists because apparently, if one worker dies, the other workers
+                # won't die with it, unless the timeout is set to some large number.  This is an empirical
+                # observation.
 
-    def _run(self):
-        rollout_provider = env_runner(self.env, self.policy, self.num_local_steps, self.summary_writer, self.visualise)
-        while True:
-            # the timeout variable exists because apparently, if one worker dies, the other workers
-            # won't die with it, unless the timeout is set to some large number.  This is an empirical
-            # observation.
-
-            self.queue.put(next(rollout_provider), timeout=600.0)
+                self.queue.put(next(rollout_provider), timeout=600.0)
 
 
-
-def env_runner(env, policy, num_local_steps, summary_writer, render):
+def env_runner(env, policy, num_local_steps, summary_writer, render) -> Iterator[PartialRollout]:
     """
-The logic of the thread runner.  In brief, it constantly keeps on running
-the policy, and as long as the rollout exceeds a certain length, the thread
-runner appends the policy to the queue.
-"""
+    The logic of the thread runner.  In brief, it constantly keeps on running
+    the policy, and as long as the rollout exceeds a certain length, the thread
+    runner appends the policy to the queue.
+    """
     last_state = env.reset()
     last_features = policy.get_initial_features()
     length = 0
@@ -134,6 +135,11 @@ runner appends the policy to the queue.
             last_state = state
             last_features = features
 
+            if terminal:
+                summary = tf.Summary()
+                summary.value.add(tag='episode_reward', simple_value=rewards)
+                summary_writer.add_summary(summary, policy.global_step.eval())
+                summary_writer.flush()
             if info:
                 summary = tf.Summary()
                 for k, v in info.items():
@@ -142,12 +148,13 @@ runner appends the policy to the queue.
                 summary_writer.flush()
 
             timestep_limit = env.spec.tags.get('wrapper_config.TimeLimit.max_episode_steps')
+            timestep_limit = 10 if timestep_limit is None else timestep_limit  # TODO(wheung) fixing a crash
             if terminal or length >= timestep_limit:
                 terminal_end = True
                 if length >= timestep_limit or not env.metadata.get('semantics.autoreset'):
                     last_state = env.reset()
                 last_features = policy.get_initial_features()
-                print("Episode finished. Sum of rewards: %d. Length: %d" % (rewards, length))
+                print("Episode finished. Sum of rewards: {}. Length: {}".format(rewards, length))
                 length = 0
                 rewards = 0
                 break
@@ -158,14 +165,16 @@ runner appends the policy to the queue.
         # once we have enough experience, yield it, and have the ThreadRunner place it on a queue
         yield rollout
 
+
 class A3C(object):
     def __init__(self, env, task, visualise):
         """
-An implementation of the A3C algorithm that is reasonably well-tuned for the VNC environments.
-Below, we will have a modest amount of complexity due to the way TensorFlow handles data parallelism.
-But overall, we'll define the model, specify its inputs, and describe how the policy gradients step
-should be computed.
-"""
+        An implementation of the A3C algorithm that is reasonably well-tuned for the VNC environments.
+        Below, we will have a modest amount of complexity due to the way TensorFlow handles data parallelism.
+        But overall, we'll define the model, specify its inputs, and describe how the policy gradients step
+        should be computed.
+        :type env: gym.Env
+        """
 
         self.env = env
         self.task = task
@@ -173,8 +182,8 @@ should be computed.
         with tf.device(tf.train.replica_device_setter(1, worker_device=worker_device)):
             with tf.variable_scope("global"):
                 self.network = LSTMPolicy(env.observation_space.shape, env.action_space.n)
-                self.global_step = tf.get_variable("global_step", [], tf.int32, initializer=tf.constant_initializer(0, dtype=tf.int32),
-                                                   trainable=False)
+                self.global_step = tf.get_variable("global_step", [], tf.int32,
+                    initializer=tf.constant_initializer(0, dtype=tf.int32), trainable=False)
 
         with tf.device(worker_device):
             with tf.variable_scope("local"):
@@ -206,28 +215,17 @@ should be computed.
             # on the one hand;  but on the other hand, we get less frequent parameter updates, which
             # slows down learning.  In this code, we found that making local steps be much
             # smaller than 20 makes the algorithm more difficult to tune and to get to work.
-            self.runner = RunnerThread(env, pi, 20, visualise)
-
+            self.runner = RunnerThread(env=env, policy=pi, num_local_steps=20, visualise=visualise)
 
             grads = tf.gradients(self.loss, pi.var_list)
 
-            if use_tf12_api:
-                tf.summary.scalar("model/policy_loss", pi_loss / bs)
-                tf.summary.scalar("model/value_loss", vf_loss / bs)
-                tf.summary.scalar("model/entropy", entropy / bs)
-                tf.summary.image("model/state", pi.x)
-                tf.summary.scalar("model/grad_global_norm", tf.global_norm(grads))
-                tf.summary.scalar("model/var_global_norm", tf.global_norm(pi.var_list))
-                self.summary_op = tf.summary.merge_all()
-
-            else:
-                tf.scalar_summary("model/policy_loss", pi_loss / bs)
-                tf.scalar_summary("model/value_loss", vf_loss / bs)
-                tf.scalar_summary("model/entropy", entropy / bs)
-                tf.image_summary("model/state", pi.x)
-                tf.scalar_summary("model/grad_global_norm", tf.global_norm(grads))
-                tf.scalar_summary("model/var_global_norm", tf.global_norm(pi.var_list))
-                self.summary_op = tf.merge_all_summaries()
+            tf.summary.scalar("model/policy_loss", pi_loss / bs)
+            tf.summary.scalar("model/value_loss", vf_loss / bs)
+            tf.summary.scalar("model/entropy", entropy / bs)
+            tf.summary.image("model/state", pi.x, max_outputs=10)
+            tf.summary.scalar("model/grad_global_norm", tf.global_norm(grads))
+            tf.summary.scalar("model/var_global_norm", tf.global_norm(pi.var_list))
+            self.summary_op = tf.summary.merge_all()
 
             grads, _ = tf.clip_by_global_norm(grads, 40.0)
 
@@ -249,8 +247,8 @@ should be computed.
 
     def pull_batch_from_queue(self):
         """
-self explanatory:  take a rollout from the queue of the thread runner.
-"""
+        self explanatory:  take a rollout from the queue of the thread runner.
+        """
         rollout = self.runner.queue.get(timeout=600.0)
         while not rollout.terminal:
             try:
@@ -259,12 +257,12 @@ self explanatory:  take a rollout from the queue of the thread runner.
                 break
         return rollout
 
-    def process(self, sess):
+    def process(self, sess: tf.Session):
         """
-process grabs a rollout that's been produced by the thread runner,
-and updates the parameters.  The update is then sent to the parameter
-server.
-"""
+        process grabs a rollout that's been produced by the thread runner,
+        and updates the parameters.  The update is then sent to the parameter
+        server.
+        """
 
         sess.run(self.sync)  # copy weights from shared to local
         rollout = self.pull_batch_from_queue()
@@ -278,12 +276,8 @@ server.
             fetches = [self.train_op, self.global_step]
 
         feed_dict = {
-            self.local_network.x: batch.si,
-            self.ac: batch.a,
-            self.adv: batch.adv,
-            self.r: batch.r,
-            self.local_network.state_in[0]: batch.features[0],
-            self.local_network.state_in[1]: batch.features[1],
+            self.local_network.x: batch.si, self.ac: batch.a, self.adv: batch.adv, self.r: batch.r,
+            self.local_network.state_in[0]: batch.features[0], self.local_network.state_in[1]: batch.features[1],
         }
 
         fetched = sess.run(fetches, feed_dict=feed_dict)
