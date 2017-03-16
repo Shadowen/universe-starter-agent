@@ -1,6 +1,5 @@
 import numpy as np
 import tensorflow as tf
-import tensorflow.contrib.rnn as rnn
 
 
 def flatten(x):
@@ -16,31 +15,14 @@ class LSTMPolicy(object):
     def __init__(self, ob_space, ac_space):
         self.x = x = tf.placeholder(tf.float32, [None] + list(ob_space))
 
-        for i in range(4):
-            x = tf.layers.conv2d(inputs=x, filters=32, name="l{}".format(i + 1), kernel_size=(3, 3), strides=(2, 2))
-        # introduce a "fake" batch dimension of 1 after flatten so that we can do LSTM over time dim
-        x = tf.expand_dims(flatten(x), [0])
+        conv1 = tf.layers.conv2d(inputs=x, filters=32, kernel_size=(5, 5), padding='same', activation=tf.nn.relu)
+        pool1 = tf.layers.max_pooling2d(inputs=conv1, pool_size=(2, 2), strides=2)
+        conv2 = tf.layers.conv2d(inputs=pool1, filters=64, kernel_size=(3, 3), padding='same', activation=tf.nn.relu)
+        pool2 = tf.layers.max_pooling2d(inputs=conv2, pool_size=(2, 2), strides=2)
+        fc1 = tf.layers.dense(inputs=flatten(pool2), units=1024, activation=tf.nn.relu)
 
-        size = 256
-        lstm = rnn.BasicLSTMCell(size, state_is_tuple=True)
-        self.state_size = lstm.state_size
-        step_size = tf.shape(self.x)[:1]
-
-        c_init = np.zeros((1, lstm.state_size.c), np.float32)
-        h_init = np.zeros((1, lstm.state_size.h), np.float32)
-        self.state_init = [c_init, h_init]
-        c_in = tf.placeholder(tf.float32, [1, lstm.state_size.c])
-        h_in = tf.placeholder(tf.float32, [1, lstm.state_size.h])
-        self.state_in = [c_in, h_in]
-
-        state_in = rnn.LSTMStateTuple(c_in, h_in)
-        lstm_outputs, lstm_state = tf.nn.dynamic_rnn(lstm, x, initial_state=state_in, sequence_length=step_size,
-            time_major=False)
-        lstm_c, lstm_h = lstm_state
-        x = tf.reshape(lstm_outputs, [-1, size])
-        self.logits = tf.layers.dense(inputs=x, units=ac_space, activation=None, name='action')
-        self.vf = tf.reshape(tf.layers.dense(inputs=x, units=1, name='value'), [-1])
-        self.state_out = [lstm_c[:1, :], lstm_h[:1, :]]
+        self.logits = tf.layers.dense(inputs=fc1, units=ac_space, activation=None, name='action')
+        self.vf = tf.reshape(tf.layers.dense(inputs=fc1, units=1, name='value'), [-1])
         self.sample = categorical_sample(self.logits, ac_space)[0, :]
         self.var_list = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, tf.get_variable_scope().name)
 
@@ -48,22 +30,18 @@ class LSTMPolicy(object):
         """ Gets the initial state of the LSTM """
         return self.state_init
 
-    def act(self, ob, c, h):
+    def act(self, ob):
         """
         Sample an action from the policy. Also returns the value of the current state.
         :param ob: observation
-        :param c: initial LSTM state c
-        :param h:  initial LSTM state h
-        :return: (action, value, *state_out)
+        :return: (action, value)
         action - action sampled from multinomial distribution
         value - value function at this state
-        *state_out - [lstm_c[:1, :], lstm_h[:1, :]] all LSTM intermediate states
         """
         sess = tf.get_default_session()
-        return sess.run([self.sample, self.vf] + self.state_out,
-            {self.x: [ob], self.state_in[0]: c, self.state_in[1]: h})
+        return sess.run([self.sample, self.vf], {self.x: [ob]})
 
     def value(self, ob, c, h):
         """ Calculate the estimated value of a given state. """
         sess = tf.get_default_session()
-        return sess.run(self.vf, {self.x: [ob], self.state_in[0]: c, self.state_in[1]: h})[0]
+        return sess.run(self.vf, {self.x: [ob]})[0]

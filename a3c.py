@@ -28,11 +28,10 @@ def process_rollout(rollout, gamma, lambda_=1.0):
     # https://arxiv.org/abs/1506.02438
     batch_adv = discount(delta_t, gamma * lambda_)
 
-    features = rollout.features[0]
-    return Batch(batch_si, batch_a, batch_adv, batch_r, rollout.terminal, features)
+    return Batch(batch_si, batch_a, batch_adv, batch_r, rollout.terminal)
 
 
-Batch = namedtuple("Batch", ["si", "a", "adv", "r", "terminal", "features"])
+Batch = namedtuple("Batch", ["si", "a", "adv", "r", "terminal"])
 
 
 class PartialRollout(object):
@@ -48,15 +47,13 @@ class PartialRollout(object):
         self.values = []
         self.r = 0.0
         self.terminal = False
-        self.features = []
 
-    def add(self, state, action, reward, value, terminal, features):
+    def add(self, state, action, reward, value, terminal):
         self.states += [state]
         self.actions += [action]
         self.rewards += [reward]
         self.values += [value]
         self.terminal = terminal
-        self.features += [features]
 
     def extend(self, other):
         assert not self.terminal
@@ -66,7 +63,6 @@ class PartialRollout(object):
         self.values.extend(other.values)
         self.r = other.r
         self.terminal = other.terminal
-        self.features.extend(other.features)
 
 
 class RunnerThread(threading.Thread):
@@ -111,7 +107,6 @@ def env_runner(env, policy, num_local_steps, summary_writer, render) -> Iterator
     runner appends the policy to the queue.
     """
     last_state = env.reset()
-    last_features = policy.get_initial_features()
     length = 0
     rewards = 0
 
@@ -120,20 +115,19 @@ def env_runner(env, policy, num_local_steps, summary_writer, render) -> Iterator
         rollout = PartialRollout()
 
         for _ in range(num_local_steps):
-            fetched = policy.act(last_state, *last_features)
-            action, value_, features = fetched[0], fetched[1], fetched[2:]
+            fetched = policy.act(last_state)
+            action, value_ = fetched[0], fetched[1]
             # argmax to convert from one-hot
             state, reward, terminal, info = env.step(action.argmax())
             if render:
                 env.render()
 
             # collect the experience
-            rollout.add(last_state, action, reward, value_, terminal, last_features)
+            rollout.add(last_state, action, reward, value_, terminal)
             length += 1
             rewards += reward
 
             last_state = state
-            last_features = features
 
             if terminal:
                 summary = tf.Summary()
@@ -153,14 +147,13 @@ def env_runner(env, policy, num_local_steps, summary_writer, render) -> Iterator
                 terminal_end = True
                 if length >= timestep_limit or not env.metadata.get('semantics.autoreset'):
                     last_state = env.reset()
-                last_features = policy.get_initial_features()
                 print("Episode finished. Sum of rewards: {}. Length: {}".format(rewards, length))
                 length = 0
                 rewards = 0
                 break
 
         if not terminal_end:
-            rollout.r = policy.value(last_state, *last_features)
+            rollout.r = policy.value(last_state)
 
         # once we have enough experience, yield it, and have the ThreadRunner place it on a queue
         yield rollout
@@ -276,8 +269,7 @@ class A3C(object):
             fetches = [self.train_op, self.global_step]
 
         feed_dict = {
-            self.local_network.x: batch.si, self.ac: batch.a, self.adv: batch.adv, self.r: batch.r,
-            self.local_network.state_in[0]: batch.features[0], self.local_network.state_in[1]: batch.features[1],
+            self.local_network.x: batch.si, self.ac: batch.a, self.adv: batch.adv, self.r: batch.r
         }
 
         fetched = sess.run(fetches, feed_dict=feed_dict)
