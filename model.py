@@ -35,7 +35,7 @@ class LSTMPolicy(object):
 
         state_in = rnn.LSTMStateTuple(c_in, h_in)
         lstm_outputs, lstm_state = tf.nn.dynamic_rnn(lstm, x, initial_state=state_in, sequence_length=step_size,
-            time_major=False)
+                                                     time_major=False)
         lstm_c, lstm_h = lstm_state
         x = tf.reshape(lstm_outputs, [-1, size])
         self.logits = tf.layers.dense(inputs=x, units=ac_space, activation=None, name='action')
@@ -61,7 +61,7 @@ class LSTMPolicy(object):
         """
         sess = tf.get_default_session()
         return sess.run([self.sample, self.vf] + self.state_out,
-            {self.x: [ob], self.state_in[0]: c, self.state_in[1]: h})
+                        {self.x: [ob], self.state_in[0]: c, self.state_in[1]: h})
 
     def value(self, ob, c, h):
         """ Calculate the estimated value of a given state. """

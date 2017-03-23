@@ -23,10 +23,10 @@ def process_rollout(rollout, gamma, lambda_=1.0):
 
     rewards_plus_v = np.asarray(rollout.rewards + [rollout.r])
     batch_r = discount(rewards_plus_v, gamma)[:-1]
-    delta_t = rewards + gamma * vpred_t[1:] - vpred_t[:-1]
+    td_error = rewards + gamma * vpred_t[1:] - vpred_t[:-1]
     # this formula for the advantage comes "Generalized Advantage Estimation":
     # https://arxiv.org/abs/1506.02438
-    batch_adv = discount(delta_t, gamma * lambda_)
+    batch_adv = discount(td_error, gamma * lambda_)
 
     features = rollout.features[0]
     return Batch(batch_si, batch_a, batch_adv, batch_r, rollout.terminal, features)
@@ -95,7 +95,7 @@ class RunnerThread(threading.Thread):
     def run(self):
         with self.sess.as_default():
             rollout_provider = env_runner(self.env, self.policy, self.num_local_steps, self.summary_writer,
-                self.visualise)
+                                          self.visualise)
             while True:
                 # the timeout variable exists because apparently, if one worker dies, the other workers
                 # won't die with it, unless the timeout is set to some large number.  This is an empirical
@@ -167,6 +167,10 @@ def env_runner(env, policy, num_local_steps, summary_writer, render) -> Iterator
 
 
 class A3C(object):
+    def start(self, sess, summary_writer):
+        self.runner.start_runner(sess, summary_writer)
+        self.summary_writer = summary_writer
+
     def __init__(self, env, task, visualise):
         """
         An implementation of the A3C algorithm that is reasonably well-tuned for the VNC environments.
@@ -183,10 +187,11 @@ class A3C(object):
             with tf.variable_scope("global"):
                 self.network = LSTMPolicy(env.observation_space.shape, env.action_space.n)
                 self.global_step = tf.get_variable("global_step", [], tf.int32,
-                    initializer=tf.constant_initializer(0, dtype=tf.int32), trainable=False)
+                                                   initializer=tf.constant_initializer(0, dtype=tf.int32),
+                                                   trainable=False)
 
         with tf.device(worker_device):
-            with tf.variable_scope("local"):
+            with tf.variable_scope("local") as local_scope:
                 self.local_network = pi = LSTMPolicy(env.observation_space.shape, env.action_space.n)
                 pi.global_step = self.global_step
 
@@ -200,14 +205,24 @@ class A3C(object):
             # the "policy gradients" loss:  its derivative is precisely the policy gradient
             # notice that self.ac is a placeholder that is provided externally.
             # adv will contain the advantages, as calculated in process_rollout
-            pi_loss = - tf.reduce_sum(tf.reduce_sum(log_prob_tf * self.ac, [1]) * self.adv)
+            pi_loss = -tf.reduce_sum(tf.reduce_sum(log_prob_tf * self.ac, [1]) * self.adv)
 
             # loss of value function
             vf_loss = 0.5 * tf.reduce_sum(tf.square(pi.vf - self.r))
-            entropy = - tf.reduce_sum(prob_tf * log_prob_tf)
+            entropy = -tf.reduce_sum(prob_tf * log_prob_tf)
 
             bs = tf.to_float(tf.shape(pi.x)[0])
+            image_size = int(np.sqrt(env.action_space.n))
+
             self.loss = pi_loss + 0.5 * vf_loss - entropy * 0.01
+            with tf.variable_scope(local_scope):
+                # Show some kind of trace of actions taken
+                self.actions_taken = tf.get_variable(name='actions_taken', shape=[env.action_space.n], dtype=tf.float32,
+                                                     trainable=False, initializer=tf.zeros_initializer())
+                action_decay_rate = 0.9999
+                self.add_action_taken = tf.assign(self.actions_taken,
+                                                  self.actions_taken * action_decay_rate + tf.reduce_sum(self.ac,
+                                                                                                         axis=0))
 
             # 20 represents the number of "local steps":  the number of timesteps
             # we run the policy before we update the parameters.
@@ -223,6 +238,10 @@ class A3C(object):
             tf.summary.scalar("model/value_loss", vf_loss / bs)
             tf.summary.scalar("model/entropy", entropy / bs)
             tf.summary.image("model/state", pi.x, max_outputs=10)
+            # tf.summary.image("model/logits_heatmap", tf.reshape(pi.logits, shape=[-1, image_size, image_size, 1]),
+            #                  max_outputs=10)
+            # tf.summary.image("model/actions_taken_heatmap",
+            #                  tf.reshape(self.actions_taken, shape=[1, image_size, image_size, 1]), max_outputs=1)
             tf.summary.scalar("model/grad_global_norm", tf.global_norm(grads))
             tf.summary.scalar("model/var_global_norm", tf.global_norm(pi.var_list))
             self.summary_op = tf.summary.merge_all()
@@ -240,10 +259,6 @@ class A3C(object):
             self.train_op = tf.group(opt.apply_gradients(grads_and_vars), inc_step)
             self.summary_writer = None
             self.local_steps = 0
-
-    def start(self, sess, summary_writer):
-        self.runner.start_runner(sess, summary_writer)
-        self.summary_writer = summary_writer
 
     def pull_batch_from_queue(self):
         """
@@ -271,7 +286,7 @@ class A3C(object):
         should_compute_summary = self.task == 0 and self.local_steps % 11 == 0
 
         if should_compute_summary:
-            fetches = [self.summary_op, self.train_op, self.global_step]
+            fetches = [self.summary_op, self.train_op, self.add_action_taken, self.global_step]
         else:
             fetches = [self.train_op, self.global_step]
 
